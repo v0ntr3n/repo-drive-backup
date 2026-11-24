@@ -1,0 +1,241 @@
+name: Download Video to Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Video URL (leave empty to process jobs.json from your Drive folder)"
+        required: false
+        default: ""
+      start_time:
+        description: "Optional start timestamp (e.g. 00:00:15 or 15)"
+        required: false
+        default: ""
+      end_time:
+        description: "Optional end timestamp (e.g. 00:00:35 or 35)"
+        required: false
+        default: ""
+      format:
+        description: "Output format"
+        required: false
+        type: choice
+        default: mp4
+        options:
+          - mp4
+          - mp3
+          - m4a
+          - both
+      max_height:
+        description: "Max video resolution height (e.g. 720 or 1080)"
+        required: false
+        default: "720"
+      output_name:
+        description: "Optional output filename without extension"
+        required: false
+        default: ""
+      subfolder:
+        description: "Target subfolder inside your Drive folder (default: clips)"
+        required: false
+        default: "clips"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  download-to-drive:
+    name: Download & Trim Media to Google Drive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install yt-dlp, ffmpeg, and rclone
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg python3-pip
+          python3 -m pip install -q -U yt-dlp
+          if ! command -v rclone >/dev/null 2>&1; then
+            curl -fsSL https://rclone.org/install.sh | sudo bash
+          fi
+          yt-dlp --version
+
+      - name: Prepare rclone config
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import datetime, json, os, pathlib, urllib.parse, urllib.request
+
+          cid = os.environ["GDRIVE_CLIENT_ID"].strip()
+          csec = os.environ["GDRIVE_CLIENT_SECRET"].strip()
+          rtok = os.environ["GDRIVE_REFRESH_TOKEN"].strip()
+          fid = os.environ["GDRIVE_FOLDER_ID"].strip()
+
+          data = urllib.parse.urlencode({
+              "client_id": cid,
+              "client_secret": csec,
+              "refresh_token": rtok,
+              "grant_type": "refresh_token",
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              "https://oauth2.googleapis.com/token",
+              data=data,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              tok_resp = json.loads(resp.read().decode("utf-8"))
+
+          expires_in = int(tok_resp.get("expires_in", 3600))
+          expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=expires_in - 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+          token_json = json.dumps({
+              "access_token": tok_resp["access_token"],
+              "token_type": tok_resp.get("token_type", "Bearer"),
+              "refresh_token": rtok,
+              "expiry": expiry,
+          })
+          cfg = "\n".join([
+              "[gdrive]",
+              "type = drive",
+              f"client_id = {cid}",
+              f"client_secret = {csec}",
+              "scope = drive",
+              f"root_folder_id = {fid}",
+              f"token = {token_json}",
+              "",
+          ])
+          p = pathlib.Path("/tmp/rclone.conf")
+          p.write_text(cfg, encoding="utf-8")
+          p.chmod(0o600)
+          PY
+
+      - name: Download, trim, and upload clips to Google Drive
+        env:
+          INPUT_URL: ${{ inputs.url }}
+          INPUT_START: ${{ inputs.start_time }}
+          INPUT_END: ${{ inputs.end_time }}
+          INPUT_FORMAT: ${{ inputs.format || 'mp4' }}
+          INPUT_MAX_HEIGHT: ${{ inputs.max_height || '720' }}
+          INPUT_NAME: ${{ inputs.output_name }}
+          INPUT_SUBFOLDER: ${{ inputs.subfolder || 'clips' }}
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/media-out
+          python3 - << 'PY'
+          import base64, json, os, pathlib, subprocess, sys
+
+          out_dir = pathlib.Path("/tmp/media-out")
+          cookies_file = None
+          cookies_b64 = os.environ.get("YT_COOKIES_B64", "").strip()
+          if cookies_b64:
+              cookies_file = pathlib.Path("/tmp/yt_cookies.txt")
+              cookies_file.write_bytes(base64.b64decode(cookies_b64))
+
+          # Build job list from workflow input OR jobs.json in Drive root folder
+          url = os.environ.get("INPUT_URL", "").strip()
+          used_drive_jobs = False
+          if url:
+              jobs = [{
+                  "url": url,
+                  "start": os.environ.get("INPUT_START", "").strip(),
+                  "end": os.environ.get("INPUT_END", "").strip(),
+                  "format": os.environ.get("INPUT_FORMAT", "mp4").strip(),
+                  "max_height": os.environ.get("INPUT_MAX_HEIGHT", "720").strip(),
+                  "name": os.environ.get("INPUT_NAME", "").strip(),
+                  "subfolder": os.environ.get("INPUT_SUBFOLDER", "clips").strip() or "clips",
+              }]
+          else:
+              jobs_path = pathlib.Path("/tmp/jobs.json")
+              r = subprocess.run(
+                  ["rclone", "copyto", "gdrive:jobs.json", str(jobs_path), "--config", "/tmp/rclone.conf"],
+                  capture_output=True, text=True
+              )
+              if r.returncode != 0 or not jobs_path.exists():
+                  raise SystemExit("No URL provided and no jobs.json found in Google Drive folder.")
+              data = json.loads(jobs_path.read_text(encoding="utf-8"))
+              jobs = data if isinstance(data, list) else data.get("jobs", [])
+              used_drive_jobs = True
+
+          if not jobs:
+              print("No jobs to process.")
+              sys.exit(0)
+
+          def run_yt(job: dict, fmt: str, target_dir: pathlib.Path):
+              j_url = job["url"].strip()
+              start = str(job.get("start", "") or "").strip()
+              end = str(job.get("end", "") or "").strip()
+              max_h = str(job.get("max_height", "720") or "720").strip()
+              name = str(job.get("name", "") or "").strip()
+
+              out_tpl = str(target_dir / (f"{name}.%(ext)s" if name else "%(title).80s_%(id)s.%(ext)s"))
+              cmd = ["yt-dlp", "--no-playlist", "--no-part", "-o", out_tpl]
+              if cookies_file:
+                  cmd += ["--cookies", str(cookies_file)]
+              if start or end:
+                  s = start or "0"
+                  e = end or "inf"
+                  cmd += ["--download-sections", f"*{s}-{e}", "--force-keyframes-at-cuts"]
+
+              if fmt == "mp3":
+                  cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "192K"]
+              elif fmt == "m4a":
+                  cmd += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
+              else:
+                  cmd += [
+                      "-f", f"bv*[height<={max_h}][ext=mp4]+ba[ext=m4a]/b[height<={max_h}][ext=mp4]/b[height<={max_h}]/best",
+                      "--merge-output-format", "mp4",
+                  ]
+              cmd.append(j_url)
+              print("Running:", " ".join(cmd))
+              subprocess.run(cmd, check=True)
+
+          subfolders_used = set()
+          for idx, job in enumerate(jobs, 1):
+              sub = str(job.get("subfolder", "") or os.environ.get("INPUT_SUBFOLDER", "clips")).strip().strip("/") or "clips"
+              subfolders_used.add(sub)
+              tdir = out_dir / sub
+              tdir.mkdir(parents=True, exist_ok=True)
+              fmt = str(job.get("format", "mp4") or "mp4").strip().lower()
+              if fmt == "both":
+                  run_yt(job, "mp4", tdir)
+                  run_yt(job, "mp3", tdir)
+              else:
+                  run_yt(job, fmt, tdir)
+
+          for f in sorted(out_dir.rglob("*")):
+              if f.is_file():
+                  print(f"Prepared: {f.relative_to(out_dir)} ({f.stat().st_size/1024/1024:.2f} MB)")
+
+          for sub in sorted(subfolders_used):
+              subprocess.run([
+                  "rclone", "copy", str(out_dir / sub), f"gdrive:{sub}",
+                  "--config", "/tmp/rclone.conf",
+                  "--transfers", "4", "-v"
+              ], check=True)
+
+          if used_drive_jobs:
+              # Rename jobs.json -> jobs.done.json on Drive so it isn't reprocessed
+              subprocess.run([
+                  "rclone", "moveto", "gdrive:jobs.json", "gdrive:jobs.done.json",
+                  "--config", "/tmp/rclone.conf"
+              ], check=False)
+          PY
+
+      - name: Cleanup temp files
+        if: always()
+        run: rm -rf /tmp/rclone.conf /tmp/media-out /tmp/jobs.json /tmp/yt_cookies.txt
+
+      - name: Auto-clean previous completed CI runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID} and .status == \"completed\") | .id")
+          for id in $runs; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" || true
+          done
