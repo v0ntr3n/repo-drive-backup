@@ -3,15 +3,14 @@ name: Sync Repo ZIP to Drive
 on:
   workflow_dispatch:
     inputs:
-      filename:
-        description: "Output ZIP filename (defaults to <repo>.zip)"
+      mode:
+        description: "rclone mode: sync (mirror & delete removed) or copy (add/update only)"
         required: false
-        default: ""
-      overwrite:
-        description: "Overwrite existing ZIP with the same name in Drive folder"
-        required: false
-        type: boolean
-        default: true
+        type: choice
+        default: sync
+        options:
+          - sync
+          - copy
   push:
     branches: [ main ]
     paths-ignore:
@@ -23,7 +22,7 @@ permissions:
 
 jobs:
   sync-to-drive:
-    name: Zip & Upload to Google Drive
+    name: Sync Repo to Google Drive (rclone)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -31,15 +30,57 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Upload repo ZIP to Google Drive
+      - name: Install rclone
+        run: |
+          if ! command -v rclone >/dev/null 2>&1; then
+            curl -fsSL https://rclone.org/install.sh | sudo bash
+          fi
+          rclone version | head -n 2
+
+      - name: Sync extracted files to Google Drive via rclone
         env:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          ZIP_FILENAME: ${{ inputs.filename }}
-          OVERWRITE_EXISTING: ${{ inputs.overwrite == false && 'false' || 'true' }}
-        run: python3 .github/scripts/upload_to_drive.py
+          RCLONE_MODE: ${{ inputs.mode || 'sync' }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, pathlib
+          token_json = json.dumps({
+              "access_token": "",
+              "token_type": "Bearer",
+              "refresh_token": os.environ["GDRIVE_REFRESH_TOKEN"].strip(),
+              "expiry": "2000-01-01T00:00:00Z",
+          })
+          cfg = "\n".join([
+              "[gdrive]",
+              "type = drive",
+              f"client_id = {os.environ['GDRIVE_CLIENT_ID'].strip()}",
+              f"client_secret = {os.environ['GDRIVE_CLIENT_SECRET'].strip()}",
+              "scope = drive",
+              f"root_folder_id = {os.environ['GDRIVE_FOLDER_ID'].strip()}",
+              f"token = {token_json}",
+              "",
+          ])
+          p = pathlib.Path("/tmp/rclone.conf")
+          p.write_text(cfg, encoding="utf-8")
+          p.chmod(0o600)
+          PY
+
+          rclone "${RCLONE_MODE}" . gdrive: \
+            --config /tmp/rclone.conf \
+            --exclude ".git/**" \
+            --exclude ".github/**" \
+            --transfers 8 \
+            --checkers 16 \
+            --fast-list \
+            -v
+
+      - name: Remove temporary rclone config
+        if: always()
+        run: rm -f /tmp/rclone.conf
 
       - name: Auto-clean previous completed CI runs
         if: always()
