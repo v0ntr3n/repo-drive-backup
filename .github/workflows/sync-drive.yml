@@ -103,7 +103,7 @@ jobs:
           cur_count = 0
 
           def open_next():
-              nonlocal part_idx, zf, cur_path, cur_est, cur_count
+              global part_idx, zf, cur_path, cur_est, cur_count
               if zf is not None:
                   zf.close()
               cur_path = out_dir / f"{repo_name}_part{part_idx:03d}.zip"
@@ -113,7 +113,7 @@ jobs:
               cur_count = 0
 
           def split_oversized_file(file_path: pathlib.Path, rel_posix: str):
-              nonlocal part_idx
+              global part_idx
               tmp_zip = out_dir / f"_oversized_{part_idx:03d}.zip"
               with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as oz:
                   oz.write(file_path, rel_posix)
