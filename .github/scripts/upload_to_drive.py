@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Zip repository contents and upload to a Google Drive folder using OAuth2 refresh token."""
+"""Sync unpacked repository files and folders directly to a Google Drive folder using OAuth2."""
 
 import json
+import mimetypes
 import os
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import zipfile
 from pathlib import Path
 
 
@@ -38,32 +37,21 @@ def get_access_token(client_id: str, client_secret: str, refresh_token: str) -> 
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"OAuth token refresh failed ({e.code}): {err_body}")
+        raise SystemExit(f"OAuth token refresh failed ({e.code}): {e.read().decode('utf-8', errors='replace')}")
     token = payload.get("access_token")
     if not token:
         raise SystemExit("OAuth response did not include access_token")
     return token
 
 
-def build_zip(repo_root: Path, out_zip: Path) -> int:
-    count = 0
-    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in sorted(repo_root.rglob("*")):
-            if not p.is_file():
-                continue
-            rel = p.relative_to(repo_root)
-            if rel.parts[0] in {".git", ".github"}:
-                continue
-            zf.write(p, rel.as_posix())
-            count += 1
-    return count
-
-
-def find_existing_file(token: str, folder_id: str, filename: str) -> str | None:
-    safe_name = filename.replace("'", "\\'")
-    q = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-    params = urllib.parse.urlencode({"q": q, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"})
+def find_item(token: str, parent_id: str, name: str, mime_type: str | None = None) -> str | None:
+    safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{safe_name}' and '{parent_id}' in parents and trashed = false"
+    if mime_type:
+        q += f" and mimeType = '{mime_type}'"
+    params = urllib.parse.urlencode(
+        {"q": q, "fields": "files(id,name)", "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+    )
     req = urllib.request.Request(
         f"https://www.googleapis.com/drive/v3/files?{params}",
         headers={"Authorization": f"Bearer {token}"},
@@ -74,19 +62,44 @@ def find_existing_file(token: str, folder_id: str, filename: str) -> str | None:
     return files[0]["id"] if files else None
 
 
-def upload_zip(token: str, folder_id: str, filename: str, zip_path: Path, overwrite: bool) -> dict:
-    existing_id = find_existing_file(token, folder_id, filename) if overwrite else None
-    metadata = {"name": filename} if existing_id else {"name": filename, "parents": [folder_id]}
+def ensure_folder(token: str, parent_id: str, name: str, cache: dict[tuple[str, str], str]) -> str:
+    key = (parent_id, name)
+    if key in cache:
+        return cache[key]
+    folder_mime = "application/vnd.google-apps.folder"
+    existing = find_item(token, parent_id, name, folder_mime)
+    if existing:
+        cache[key] = existing
+        return existing
+
+    body = json.dumps({"name": name, "mimeType": folder_mime, "parents": [parent_id]}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.googleapis.com/drive/v3/files?supportsAllDrives=true",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        fid = json.loads(resp.read().decode("utf-8"))["id"]
+    cache[key] = fid
+    return fid
+
+
+def upload_file(token: str, parent_id: str, file_path: Path, overwrite: bool) -> dict:
+    name = file_path.name
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    existing_id = find_item(token, parent_id, name) if overwrite else None
+    metadata = {"name": name} if existing_id else {"name": name, "parents": [parent_id]}
 
     boundary = f"----gdrive-{uuid.uuid4().hex}"
-    zip_bytes = zip_path.read_bytes()
+    file_bytes = file_path.read_bytes()
     body = (
         f"--{boundary}\r\n"
         f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
         f"{json.dumps(metadata)}\r\n"
         f"--{boundary}\r\n"
-        f"Content-Type: application/zip\r\n\r\n"
-    ).encode("utf-8") + zip_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode("utf-8") + file_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
 
     if existing_id:
         url = f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}?uploadType=multipart&supportsAllDrives=true"
@@ -109,29 +122,35 @@ def upload_zip(token: str, folder_id: str, filename: str, zip_path: Path, overwr
         with urllib.request.urlopen(req, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"Drive upload failed ({e.code}): {err_body}")
+        raise SystemExit(f"Drive upload failed for {file_path} ({e.code}): {e.read().decode('utf-8', errors='replace')}")
 
 
 def main() -> None:
     client_id = get_env("GDRIVE_CLIENT_ID")
     client_secret = get_env("GDRIVE_CLIENT_SECRET")
     refresh_token = get_env("GDRIVE_REFRESH_TOKEN")
-    folder_id = get_env("GDRIVE_FOLDER_ID")
-
-    repo_name = os.environ.get("GITHUB_REPOSITORY", "repo").split("/")[-1]
-    filename = os.environ.get("ZIP_FILENAME", "").strip() or f"{repo_name}.zip"
-    if not filename.endswith(".zip"):
-        filename += ".zip"
+    root_folder_id = get_env("GDRIVE_FOLDER_ID")
     overwrite = os.environ.get("OVERWRITE_EXISTING", "true").lower() == "true"
 
-    zip_path = Path("/tmp") / filename
-    count = build_zip(Path.cwd(), zip_path)
-    print(f"Packed {count} files into {zip_path} ({zip_path.stat().st_size} bytes)")
-
     token = get_access_token(client_id, client_secret, refresh_token)
-    res = upload_zip(token, folder_id, filename, zip_path, overwrite)
-    print(f"Uploaded to Google Drive: id={res.get('id')} name={res.get('name')}")
+    folder_cache: dict[tuple[str, str], str] = {}
+    repo_root = Path.cwd()
+    uploaded = 0
+
+    for p in sorted(repo_root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(repo_root)
+        if rel.parts[0] in {".git", ".github"}:
+            continue
+        parent_id = root_folder_id
+        for part in rel.parts[:-1]:
+            parent_id = ensure_folder(token, parent_id, part, folder_cache)
+        res = upload_file(token, parent_id, p, overwrite)
+        uploaded += 1
+        print(f"Uploaded {rel.as_posix()} -> id={res.get('id')}")
+
+    print(f"Done: uploaded {uploaded} extracted file(s) to Drive folder {root_folder_id}")
 
 
 if __name__ == "__main__":
