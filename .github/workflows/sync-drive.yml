@@ -1,0 +1,53 @@
+name: Sync Repo ZIP to Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      filename:
+        description: "Output ZIP filename (defaults to <repo>.zip)"
+        required: false
+        default: ""
+      overwrite:
+        description: "Overwrite existing ZIP with the same name in Drive folder"
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - ".github/**"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sync-to-drive:
+    name: Zip & Upload to Google Drive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Upload repo ZIP to Google Drive
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          ZIP_FILENAME: ${{ inputs.filename }}
+          OVERWRITE_EXISTING: ${{ inputs.overwrite == false && 'false' || 'true' }}
+        run: python3 .github/scripts/upload_to_drive.py
+
+      - name: Auto-clean previous completed CI runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID} and .status == \"completed\") | .id")
+          for id in $runs; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" || true
+          done
