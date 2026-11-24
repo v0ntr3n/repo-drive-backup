@@ -47,20 +47,43 @@ jobs:
         run: |
           set -euo pipefail
           python3 - << 'PY'
-          import json, os, pathlib
+          import datetime, json, os, pathlib, urllib.parse, urllib.request
+
+          cid = os.environ["GDRIVE_CLIENT_ID"].strip()
+          csec = os.environ["GDRIVE_CLIENT_SECRET"].strip()
+          rtok = os.environ["GDRIVE_REFRESH_TOKEN"].strip()
+          fid = os.environ["GDRIVE_FOLDER_ID"].strip()
+
+          data = urllib.parse.urlencode({
+              "client_id": cid,
+              "client_secret": csec,
+              "refresh_token": rtok,
+              "grant_type": "refresh_token",
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              "https://oauth2.googleapis.com/token",
+              data=data,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              tok_resp = json.loads(resp.read().decode("utf-8"))
+
+          expires_in = int(tok_resp.get("expires_in", 3600))
+          expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=expires_in - 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
           token_json = json.dumps({
-              "access_token": "",
-              "token_type": "Bearer",
-              "refresh_token": os.environ["GDRIVE_REFRESH_TOKEN"].strip(),
-              "expiry": "2000-01-01T00:00:00Z",
+              "access_token": tok_resp["access_token"],
+              "token_type": tok_resp.get("token_type", "Bearer"),
+              "refresh_token": rtok,
+              "expiry": expiry,
           })
           cfg = "\n".join([
               "[gdrive]",
               "type = drive",
-              f"client_id = {os.environ['GDRIVE_CLIENT_ID'].strip()}",
-              f"client_secret = {os.environ['GDRIVE_CLIENT_SECRET'].strip()}",
+              f"client_id = {cid}",
+              f"client_secret = {csec}",
               "scope = drive",
-              f"root_folder_id = {os.environ['GDRIVE_FOLDER_ID'].strip()}",
+              f"root_folder_id = {fid}",
               f"token = {token_json}",
               "",
           ])
