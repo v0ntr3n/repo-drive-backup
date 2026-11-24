@@ -38,36 +38,37 @@ on:
         required: false
         default: ""
       subfolder:
-        description: "Target subfolder inside your Drive folder (default: clips)"
+        description: "Target subfolder inside Drive & GH_backup/ (default: clips)"
         required: false
         default: "clips"
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
   download-to-drive:
-    name: Download & Trim Media to Google Drive
+    name: Download, Trim, Validate & Sync Media (Cookie-Free)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository (for repo jobs.json)
-        if: github.event_name == 'push'
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install yt-dlp[default], ffmpeg, and rclone
+      - name: Install pytubefix, yt-dlp, YouTube.js, ffmpeg, and rclone
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg python3-pip
-          python3 -m pip install -q -U "yt-dlp[default]"
+          python3 -m pip install -q -U pytubefix "yt-dlp[default]"
+          npm install --no-save --prefix /tmp/ytjs youtubei.js >/dev/null 2>&1 || true
           if ! command -v rclone >/dev/null 2>&1; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
+          python3 -c "import pytubefix; print('pytubefix:', pytubefix.__version__)"
           yt-dlp --version
-          node --version
+          ffmpeg -version | head -n 1
 
       - name: Prepare rclone config
         env:
@@ -123,7 +124,7 @@ jobs:
           p.chmod(0o600)
           PY
 
-      - name: Download, trim, and upload clips to Google Drive
+      - name: Download (cookie-free multi-engine), trim, validate with ffprobe, and upload
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_URL: ${{ inputs.url }}
@@ -133,21 +134,15 @@ jobs:
           INPUT_MAX_HEIGHT: ${{ inputs.max_height || '720' }}
           INPUT_NAME: ${{ inputs.output_name }}
           INPUT_SUBFOLDER: ${{ inputs.subfolder || 'clips' }}
-          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/media-out
+          mkdir -p /tmp/media-raw /tmp/media-out
           python3 - << 'PY'
-          import base64, json, os, pathlib, subprocess, sys
+          import json, os, pathlib, re, shutil, subprocess, sys
 
+          raw_dir = pathlib.Path("/tmp/media-raw")
           out_dir = pathlib.Path("/tmp/media-out")
-          cookies_file = None
-          cookies_b64 = os.environ.get("YT_COOKIES_B64", "").strip()
-          if cookies_b64:
-              cookies_file = pathlib.Path("/tmp/yt_cookies.txt")
-              cookies_file.write_bytes(base64.b64decode(cookies_b64))
 
-          # Build job list from: (1) repo jobs.json on push, (2) workflow_dispatch url, or (3) gdrive:jobs.json
           event_name = os.environ.get("EVENT_NAME", "")
           url = os.environ.get("INPUT_URL", "").strip()
           used_drive_jobs = False
@@ -174,7 +169,11 @@ jobs:
               )
               if r.returncode != 0 or not jobs_path.exists():
                   raise SystemExit("No URL provided and no jobs.json found in Google Drive folder.")
-              data = json.loads(jobs_path.read_text(encoding="utf-8"))
+              raw_json = jobs_path.read_text(encoding="utf-8")
+              print("=== LOADED_JOBS_JSON ===")
+              print(raw_json)
+              print("=== END_JOBS_JSON ===")
+              data = json.loads(raw_json)
               jobs = data if isinstance(data, list) else data.get("jobs", [])
               used_drive_jobs = True
 
@@ -182,73 +181,176 @@ jobs:
               print("No jobs to process.")
               sys.exit(0)
 
-          def run_yt(job: dict, fmt: str, target_dir: pathlib.Path) -> bool:
-              j_url = job["url"].strip()
-              start = str(job.get("start", "") or "").strip()
-              end = str(job.get("end", "") or "").strip()
-              max_h = str(job.get("max_height", "720") or "720").strip()
-              name = str(job.get("name", "") or "").strip()
+          def try_pytubefix(j_url: str, fmt: str, max_h: int, dest_base: pathlib.Path) -> pathlib.Path | None:
+              from pytubefix import YouTube
+              for client in ("ANDROID_VR", "ANDROID", "IOS", "WEB"):
+                  try:
+                      yt = YouTube(j_url, client=client)
+                      if fmt in ("mp3", "m4a"):
+                          stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+                          if not stream:
+                              continue
+                          dl = pathlib.Path(stream.download(output_path=str(dest_base.parent), filename=f"{dest_base.name}_raw_a.{stream.subtype}"))
+                          print(f"  [pytubefix:{client}] downloaded audio -> {dl.name}")
+                          return dl
+                      else:
+                          # Prefer progressive <= max_h, else adaptive video+audio merge
+                          prog = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc()
+                          chosen = None
+                          for s in prog:
+                              h = int((s.resolution or "0p").rstrip("p") or 0)
+                              if h <= max_h:
+                                  chosen = s
+                                  break
+                          v_stream = None
+                          for s in yt.streams.filter(adaptive=True, only_video=True, file_extension="mp4").order_by("resolution").desc():
+                              h = int((s.resolution or "0p").rstrip("p") or 0)
+                              if h <= max_h:
+                                  v_stream = s
+                                  break
+                          a_stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+                          if v_stream and a_stream:
+                              vp = pathlib.Path(v_stream.download(output_path=str(dest_base.parent), filename=f"{dest_base.name}_raw_v.mp4"))
+                              ap = pathlib.Path(a_stream.download(output_path=str(dest_base.parent), filename=f"{dest_base.name}_raw_a.{a_stream.subtype}"))
+                              merged = dest_base.parent / f"{dest_base.name}_raw_merged.mp4"
+                              subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(vp), "-i", str(ap), "-c:v", "copy", "-c:a", "aac", "-shortest", str(merged)], check=True)
+                              vp.unlink(missing_ok=True)
+                              ap.unlink(missing_ok=True)
+                              print(f"  [pytubefix:{client}] downloaded adaptive {v_stream.resolution}+audio -> {merged.name}")
+                              return merged
+                          elif chosen:
+                              dl = pathlib.Path(chosen.download(output_path=str(dest_base.parent), filename=f"{dest_base.name}_raw.mp4"))
+                              print(f"  [pytubefix:{client}] downloaded progressive {chosen.resolution} -> {dl.name}")
+                              return dl
+                  except Exception as e:
+                      print(f"  [pytubefix:{client}] failed: {e}")
+              return None
 
-              out_tpl = str(target_dir / (f"{name}.%(ext)s" if name else "%(title).80s_%(id)s.%(ext)s"))
-              cmd = ["yt-dlp", "--js-runtimes", "node", "--no-playlist", "--no-part", "-o", out_tpl]
-              if cookies_file:
-                  cmd += ["--cookies", str(cookies_file)]
-              if start or end:
-                  s = start or "0"
-                  e = end or "inf"
-                  cmd += ["--download-sections", f"*{s}-{e}", "--force-keyframes-at-cuts"]
+          def try_ytdlp(j_url: str, fmt: str, max_h: int, dest_base: pathlib.Path) -> pathlib.Path | None:
+              for extra in (
+                  ["--extractor-args", "youtube:player_client=android_vr"],
+                  ["--extractor-args", "youtube:player_client=tv_embedded"],
+                  [],
+              ):
+                  out_tpl = str(dest_base.parent / f"{dest_base.name}_ytdlp.%(ext)s")
+                  cmd = ["yt-dlp", "--js-runtimes", "node", "--no-playlist", "--no-part", "-o", out_tpl] + extra
+                  if fmt in ("mp3", "m4a"):
+                      cmd += ["-f", "ba/best"]
+                  else:
+                      cmd += ["-f", f"bv*[height<={max_h}][ext=mp4]+ba[ext=m4a]/b[height<={max_h}]/best", "--merge-output-format", "mp4"]
+                  cmd.append(j_url)
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  if res.returncode == 0:
+                      matches = list(dest_base.parent.glob(f"{dest_base.name}_ytdlp.*"))
+                      if matches:
+                          print(f"  [yt-dlp:{extra or 'default'}] downloaded -> {matches[0].name}")
+                          return matches[0]
+                  else:
+                      err_line = (res.stderr or "").strip().splitlines()[-1:] or [""]
+                      print(f"  [yt-dlp:{extra or 'default'}] failed: {err_line[0]}")
+              return None
 
+          def trim_and_encode(raw_path: pathlib.Path, final_path: pathlib.Path, fmt: str, start: str, end: str, max_h: int):
+              cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+              if start:
+                  cmd += ["-ss", start]
+              cmd += ["-i", str(raw_path)]
+              if end:
+                  cmd += ["-to", end]
               if fmt == "mp3":
-                  cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "192K"]
+                  cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(final_path)]
               elif fmt == "m4a":
-                  cmd += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
+                  cmd += ["-vn", "-c:a", "aac", "-b:a", "192k", str(final_path)]
               else:
                   cmd += [
-                      "-f", f"bv*[height<={max_h}][ext=mp4]+ba[ext=m4a]/b[height<={max_h}][ext=mp4]/b[height<={max_h}]/best",
-                      "--merge-output-format", "mp4",
+                      "-vf", f"scale='min(iw,trunc(iw*{max_h}/ih/2)*2)':'min(ih,{max_h})':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                      str(final_path),
                   ]
-              cmd.append(j_url)
-              print("Running:", " ".join(cmd))
-              res = subprocess.run(cmd, check=False)
-              if res.returncode != 0:
-                  print(f"::warning::yt-dlp failed (exit {res.returncode}) for {name or j_url} ({fmt})")
-                  return False
-              return True
+              subprocess.run(cmd, check=True)
+
+          def ffprobe_validate(path: pathlib.Path, fmt: str) -> dict:
+              r = subprocess.run(
+                  ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+                  capture_output=True, text=True, check=True
+              )
+              info = json.loads(r.stdout)
+              dur = float(info.get("format", {}).get("duration", 0))
+              streams = info.get("streams", [])
+              v = next((s for s in streams if s.get("codec_type") == "video"), None)
+              a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+              if dur <= 0:
+                  raise RuntimeError("Invalid duration <= 0")
+              if fmt == "mp4" and not v:
+                  raise RuntimeError("Missing video stream")
+              if not a:
+                  raise RuntimeError("Missing audio stream")
+              return {
+                  "file": path.name,
+                  "size_mb": round(path.stat().st_size / 1024 / 1024, 2),
+                  "duration_s": round(dur, 2),
+                  "video": f"{v.get('codec_name')} {v.get('width')}x{v.get('height')}" if v else None,
+                  "audio": f"{a.get('codec_name')} {a.get('sample_rate')}Hz {a.get('channels')}ch" if a else None,
+              }
 
           subfolders_used = set()
-          succeeded = 0
+          succeeded = []
           failed = []
+
           for idx, job in enumerate(jobs, 1):
+              j_url = job["url"].strip()
               sub = str(job.get("subfolder", "") or os.environ.get("INPUT_SUBFOLDER", "clips")).strip().strip("/") or "clips"
+              start = str(job.get("start", "") or "").strip()
+              end = str(job.get("end", "") or "").strip()
+              max_h = int(str(job.get("max_height", "720") or "720").strip())
+              name = str(job.get("name", "") or f"clip_{idx:02d}").strip()
+              fmt = str(job.get("format", "mp4") or "mp4").strip().lower()
+              fmts = ["mp4", "mp3"] if fmt == "both" else [fmt]
+
               subfolders_used.add(sub)
               tdir = out_dir / sub
               tdir.mkdir(parents=True, exist_ok=True)
-              fmt = str(job.get("format", "mp4") or "mp4").strip().lower()
-              fmts = ["mp4", "mp3"] if fmt == "both" else [fmt]
+
+              print(f"\n[{idx}/{len(jobs)}] {name} ({fmt}) start={start or '-'} end={end or '-'} url={j_url}")
               for f_item in fmts:
-                  if run_yt(job, f_item, tdir):
-                      succeeded += 1
-                  else:
-                      failed.append(f"{job.get('name') or job.get('url')} ({f_item})")
+                  dest_base = raw_dir / f"{idx:02d}_{name}_{f_item}"
+                  raw_file = try_pytubefix(j_url, f_item, max_h, dest_base)
+                  if not raw_file:
+                      raw_file = try_ytdlp(j_url, f_item, max_h, dest_base)
+                  if not raw_file:
+                      failed.append(f"{name}.{f_item}")
+                      continue
+                  final_file = tdir / f"{name}.{f_item}"
+                  try:
+                      trim_and_encode(raw_file, final_file, f_item, start, end, max_h)
+                      meta = ffprobe_validate(final_file, f_item)
+                      print(f"  [VALIDATED] {json.dumps(meta)}")
+                      succeeded.append(meta)
+                  except Exception as e:
+                      print(f"  [ERROR] trim/validate failed for {name}.{f_item}: {e}")
+                      failed.append(f"{name}.{f_item}")
 
-          prepared_files = [f for f in sorted(out_dir.rglob("*")) if f.is_file()]
-          for f in prepared_files:
-              print(f"Prepared: {f.relative_to(out_dir)} ({f.stat().st_size/1024/1024:.2f} MB)")
-
-          if prepared_files:
+          # Upload succeeded files to Drive AND copy into GH_backup/<sub/> for git commit
+          if succeeded:
               for sub in sorted(subfolders_used):
-                  if any((out_dir / sub).rglob("*")):
+                  sub_out = out_dir / sub
+                  if any(sub_out.rglob("*")):
                       subprocess.run([
-                          "rclone", "copy", str(out_dir / sub), f"gdrive:{sub}",
-                          "--config", "/tmp/rclone.conf",
-                          "--transfers", "4", "-v"
+                          "rclone", "copy", str(sub_out), f"gdrive:{sub}",
+                          "--config", "/tmp/rclone.conf", "--transfers", "4", "-v"
                       ], check=True)
+                      gh_dest = pathlib.Path("GH_backup") / sub
+                      gh_dest.mkdir(parents=True, exist_ok=True)
+                      for f in sub_out.iterdir():
+                          if f.is_file():
+                              shutil.copy2(f, gh_dest / f.name)
 
-          print(f"Summary: succeeded={succeeded}, failed={len(failed)}")
+          print(f"\nFINAL_SUMMARY: succeeded={len(succeeded)} failed={len(failed)}")
           if failed:
-              print("Failed items:", ", ".join(failed))
+              print("FAILED_LIST:", ", ".join(failed))
 
-          if used_drive_jobs and succeeded > 0 and not failed:
+          if used_drive_jobs and succeeded and not failed:
               subprocess.run([
                   "rclone", "moveto", "gdrive:jobs.json", "gdrive:jobs.done.json",
                   "--config", "/tmp/rclone.conf"
@@ -258,9 +360,20 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Commit and push validated clips to GitHub
+        if: always()
+        run: |
+          if [ -d GH_backup ] && [ -n "$(git status --porcelain GH_backup)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add GH_backup
+            git commit -m "media: add validated clips to GH_backup"
+            git push
+          fi
+
       - name: Cleanup temp files
         if: always()
-        run: rm -rf /tmp/rclone.conf /tmp/media-out /tmp/jobs.json /tmp/yt_cookies.txt
+        run: rm -rf /tmp/rclone.conf /tmp/media-raw /tmp/media-out /tmp/jobs.json
 
       - name: Auto-clean previous completed CI runs
         if: always()
