@@ -60,14 +60,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg python3-pip
-          python3 -m pip install -q -U pytubefix "yt-dlp[default]"
+          sudo apt-get install -y -qq ffmpeg python3-venv
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install -q -U pip
+          /tmp/venv/bin/pip install -q -U pytubefix "yt-dlp[default]"
+          echo "/tmp/venv/bin" >> "$GITHUB_PATH"
           npm install --no-save --prefix /tmp/ytjs youtubei.js >/dev/null 2>&1 || true
           if ! command -v rclone >/dev/null 2>&1; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
-          python3 -c "import pytubefix; print('pytubefix:', pytubefix.__version__)"
-          yt-dlp --version
+          /tmp/venv/bin/python -c "import pytubefix; print('pytubefix:', pytubefix.__version__)"
+          /tmp/venv/bin/yt-dlp --version
           ffmpeg -version | head -n 1
 
       - name: Prepare rclone config
@@ -78,7 +81,7 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           set -euo pipefail
-          python3 - << 'PY'
+          /tmp/venv/bin/python - << 'PY'
           import datetime, json, os, pathlib, urllib.parse, urllib.request
 
           cid = os.environ["GDRIVE_CLIENT_ID"].strip()
@@ -137,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/media-raw /tmp/media-out
-          python3 - << 'PY'
+          /tmp/venv/bin/python - << 'PY'
           import json, os, pathlib, re, shutil, subprocess, sys
 
           raw_dir = pathlib.Path("/tmp/media-raw")
