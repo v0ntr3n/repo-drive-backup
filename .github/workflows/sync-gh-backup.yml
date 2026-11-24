@@ -1,0 +1,65 @@
+name: Sync GH_backup to Drive
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "GH_backup/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sync-gh-backup:
+    name: Copy GH_backup to Google Drive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install rclone
+        run: |
+          if ! command -v rclone >/dev/null 2>&1; then
+            curl -fsSL https://rclone.org/install.sh | sudo bash
+          fi
+
+      - name: Copy GH_backup/ to Google Drive
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import datetime, json, os, pathlib, urllib.parse, urllib.request
+          cid = os.environ["GDRIVE_CLIENT_ID"].strip()
+          csec = os.environ["GDRIVE_CLIENT_SECRET"].strip()
+          rtok = os.environ["GDRIVE_REFRESH_TOKEN"].strip()
+          fid = os.environ["GDRIVE_FOLDER_ID"].strip()
+          data = urllib.parse.urlencode({
+              "client_id": cid, "client_secret": csec,
+              "refresh_token": rtok, "grant_type": "refresh_token",
+          }).encode("utf-8")
+          req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data,
+              headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              tok_resp = json.loads(resp.read().decode("utf-8"))
+          expires_in = int(tok_resp.get("expires_in", 3600))
+          expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=expires_in - 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+          token_json = json.dumps({"access_token": tok_resp["access_token"], "token_type": "Bearer", "refresh_token": rtok, "expiry": expiry})
+          p = pathlib.Path("/tmp/rclone.conf")
+          p.write_text(f"[gdrive]\ntype = drive\nclient_id = {cid}\nclient_secret = {csec}\nscope = drive\nroot_folder_id = {fid}\ntoken = {token_json}\n", encoding="utf-8")
+          p.chmod(0o600)
+          PY
+
+          rclone copy GH_backup gdrive: --config /tmp/rclone.conf --transfers 6 -v
+          rclone moveto gdrive:jobs.json gdrive:jobs.done.json --config /tmp/rclone.conf || true
+
+      - name: Cleanup
+        if: always()
+        run: rm -f /tmp/rclone.conf
