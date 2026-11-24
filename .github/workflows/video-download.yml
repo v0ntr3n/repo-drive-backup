@@ -57,16 +57,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install yt-dlp, ffmpeg, and rclone
+      - name: Install yt-dlp[default], ffmpeg, and rclone
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg python3-pip
-          python3 -m pip install -q -U yt-dlp
+          python3 -m pip install -q -U "yt-dlp[default]"
           if ! command -v rclone >/dev/null 2>&1; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
           yt-dlp --version
+          node --version
 
       - name: Prepare rclone config
         env:
@@ -181,7 +182,7 @@ jobs:
               print("No jobs to process.")
               sys.exit(0)
 
-          def run_yt(job: dict, fmt: str, target_dir: pathlib.Path):
+          def run_yt(job: dict, fmt: str, target_dir: pathlib.Path) -> bool:
               j_url = job["url"].strip()
               start = str(job.get("start", "") or "").strip()
               end = str(job.get("end", "") or "").strip()
@@ -189,7 +190,7 @@ jobs:
               name = str(job.get("name", "") or "").strip()
 
               out_tpl = str(target_dir / (f"{name}.%(ext)s" if name else "%(title).80s_%(id)s.%(ext)s"))
-              cmd = ["yt-dlp", "--no-playlist", "--no-part", "-o", out_tpl]
+              cmd = ["yt-dlp", "--js-runtimes", "node", "--no-playlist", "--no-part", "-o", out_tpl]
               if cookies_file:
                   cmd += ["--cookies", str(cookies_file)]
               if start or end:
@@ -208,37 +209,53 @@ jobs:
                   ]
               cmd.append(j_url)
               print("Running:", " ".join(cmd))
-              subprocess.run(cmd, check=True)
+              res = subprocess.run(cmd, check=False)
+              if res.returncode != 0:
+                  print(f"::warning::yt-dlp failed (exit {res.returncode}) for {name or j_url} ({fmt})")
+                  return False
+              return True
 
           subfolders_used = set()
+          succeeded = 0
+          failed = []
           for idx, job in enumerate(jobs, 1):
               sub = str(job.get("subfolder", "") or os.environ.get("INPUT_SUBFOLDER", "clips")).strip().strip("/") or "clips"
               subfolders_used.add(sub)
               tdir = out_dir / sub
               tdir.mkdir(parents=True, exist_ok=True)
               fmt = str(job.get("format", "mp4") or "mp4").strip().lower()
-              if fmt == "both":
-                  run_yt(job, "mp4", tdir)
-                  run_yt(job, "mp3", tdir)
-              else:
-                  run_yt(job, fmt, tdir)
+              fmts = ["mp4", "mp3"] if fmt == "both" else [fmt]
+              for f_item in fmts:
+                  if run_yt(job, f_item, tdir):
+                      succeeded += 1
+                  else:
+                      failed.append(f"{job.get('name') or job.get('url')} ({f_item})")
 
-          for f in sorted(out_dir.rglob("*")):
-              if f.is_file():
-                  print(f"Prepared: {f.relative_to(out_dir)} ({f.stat().st_size/1024/1024:.2f} MB)")
+          prepared_files = [f for f in sorted(out_dir.rglob("*")) if f.is_file()]
+          for f in prepared_files:
+              print(f"Prepared: {f.relative_to(out_dir)} ({f.stat().st_size/1024/1024:.2f} MB)")
 
-          for sub in sorted(subfolders_used):
-              subprocess.run([
-                  "rclone", "copy", str(out_dir / sub), f"gdrive:{sub}",
-                  "--config", "/tmp/rclone.conf",
-                  "--transfers", "4", "-v"
-              ], check=True)
+          if prepared_files:
+              for sub in sorted(subfolders_used):
+                  if any((out_dir / sub).rglob("*")):
+                      subprocess.run([
+                          "rclone", "copy", str(out_dir / sub), f"gdrive:{sub}",
+                          "--config", "/tmp/rclone.conf",
+                          "--transfers", "4", "-v"
+                      ], check=True)
 
-          if used_drive_jobs:
+          print(f"Summary: succeeded={succeeded}, failed={len(failed)}")
+          if failed:
+              print("Failed items:", ", ".join(failed))
+
+          if used_drive_jobs and succeeded > 0 and not failed:
               subprocess.run([
                   "rclone", "moveto", "gdrive:jobs.json", "gdrive:jobs.done.json",
                   "--config", "/tmp/rclone.conf"
               ], check=False)
+
+          if failed:
+              sys.exit(1)
           PY
 
       - name: Cleanup temp files
