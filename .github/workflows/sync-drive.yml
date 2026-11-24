@@ -27,6 +27,7 @@ on:
     branches: [ main ]
     paths-ignore:
       - ".github/**"
+      - "jobs.json"
 
 permissions:
   contents: read
