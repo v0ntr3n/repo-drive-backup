@@ -2,43 +2,48 @@
   "jobs": [
     {
       "url": "https://www.youtube.com/watch?v=unawbXKdSZI",
+      "start": "3",
+      "end": "32",
       "format": "mp4",
-      "max_height": "1080",
-      "name": "01_cnbc_campus_return",
-      "subfolder": "jensen_comeback_clips"
+      "max_height": "720",
+      "name": "t01_campus_return",
+      "subfolder": "jensen_trimmed"
     },
     {
       "url": "https://www.youtube.com/watch?v=5mNCHODJ_HA",
+      "start": "58",
+      "end": "38",
       "format": "mp4",
       "max_height": "720",
-      "name": "02_nbc_nightly_news",
-      "subfolder": "jensen_comeback_clips"
+      "name": "t02_nbc_news",
+      "subfolder": "jensen_trimmed"
     },
     {
       "url": "https://www.youtube.com/watch?v=SPGn9MZb1a0",
+      "start": "0",
+      "end": "35",
       "format": "mp4",
-      "max_height": "1080",
-      "name": "03_gtc_keynote_stage",
-      "subfolder": "jensen_comeback_clips"
+      "max_height": "720",
+      "name": "t03a_gtc_stage",
+      "subfolder": "jensen_trimmed"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=SPGn9MZb1a0",
+      "start": "110",
+      "end": "23",
+      "format": "mp4",
+      "max_height": "720",
+      "name": "t03b_gtc_stage",
+      "subfolder": "jensen_trimmed"
     },
     {
       "url": "https://www.youtube.com/watch?v=SRiV0RgHWI0",
+      "start": "1",
+      "end": "46",
       "format": "mp4",
-      "max_height": "1080",
-      "name": "04_rtx_blackwell_gpu",
-      "subfolder": "jensen_comeback_clips"
-    },
-    {
-      "url": "https://www.youtube.com/watch?v=5P-GKWZdLMM",
-      "format": "m4a",
-      "name": "05_dark_phonk_beat",
-      "subfolder": "jensen_comeback_clips"
-    },
-    {
-      "url": "https://www.youtube.com/watch?v=l_TTMOdZFag",
-      "format": "m4a",
-      "name": "06_infraction_phonk",
-      "subfolder": "jensen_comeback_clips"
+      "max_height": "720",
+      "name": "t04_rtx_blackwell",
+      "subfolder": "jensen_trimmed"
     }
   ]
 }
