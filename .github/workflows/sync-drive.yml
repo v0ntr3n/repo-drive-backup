@@ -11,6 +11,10 @@ on:
         description: "Optional branch or tag (empty = default branch)"
         required: false
         default: ""
+      max_zip_mb:
+        description: "Max size per ZIP part in MB (default 9, strictly <10MB)"
+        required: false
+        default: "9"
       mode:
         description: "rclone mode: sync (mirror & delete removed) or copy (add/update only)"
         required: false
@@ -30,7 +34,7 @@ permissions:
 
 jobs:
   sync-to-drive:
-    name: Sync Repo to Google Drive (rclone)
+    name: Pack (<10MB ZIPs) & Sync to Google Drive (rclone)
     runs-on: ubuntu-latest
     steps:
       - name: Prepare source repository
@@ -61,14 +65,109 @@ jobs:
           echo "repo_name=${REPO_NAME}" >> "$GITHUB_OUTPUT"
         shell: bash
 
+      - name: Pack repository into standalone <10MB ZIP parts
+        env:
+          REPO_NAME: ${{ steps.prep.outputs.repo_name }}
+          MAX_ZIP_MB: ${{ inputs.max_zip_mb || '9' }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import os, pathlib, shutil, zipfile, zlib
+
+          src = pathlib.Path("/tmp/src-repo")
+          out_dir = pathlib.Path("/tmp/out-zips")
+          if out_dir.exists():
+              shutil.rmtree(out_dir)
+          out_dir.mkdir(parents=True)
+
+          repo_name = os.environ["REPO_NAME"]
+          max_mb = float(os.environ.get("MAX_ZIP_MB", "9"))
+          # Keep safety margin for ZIP central directory overhead so every file is strictly < max_mb MB (and <10MB)
+          limit_bytes = int(min(max_mb, 9.5) * 1024 * 1024)
+          central_dir_margin = 256 * 1024
+          target_bytes = max(limit_bytes - central_dir_margin, 1024 * 1024)
+
+          files = []
+          for p in sorted(src.rglob("*")):
+              if not p.is_file() or p.is_symlink():
+                  continue
+              rel = p.relative_to(src)
+              if rel.parts[0] in {".git", ".github"}:
+                  continue
+              files.append((p, rel.as_posix()))
+
+          part_idx = 1
+          zf = None
+          cur_path = None
+          cur_est = 0
+          cur_count = 0
+
+          def open_next():
+              nonlocal part_idx, zf, cur_path, cur_est, cur_count
+              if zf is not None:
+                  zf.close()
+              cur_path = out_dir / f"{repo_name}_part{part_idx:03d}.zip"
+              part_idx += 1
+              zf = zipfile.ZipFile(cur_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6)
+              cur_est = 0
+              cur_count = 0
+
+          def split_oversized_file(file_path: pathlib.Path, rel_posix: str):
+              nonlocal part_idx
+              tmp_zip = out_dir / f"_oversized_{part_idx:03d}.zip"
+              with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as oz:
+                  oz.write(file_path, rel_posix)
+              if tmp_zip.stat().st_size <= limit_bytes:
+                  final_p = out_dir / f"{repo_name}_part{part_idx:03d}.zip"
+                  part_idx += 1
+                  tmp_zip.rename(final_p)
+                  return
+              # Split compressed archive into <limit_bytes chunks
+              chunk_idx = 1
+              base = f"{repo_name}_part{part_idx:03d}.zip"
+              part_idx += 1
+              with tmp_zip.open("rb") as rf:
+                  while True:
+                      chunk = rf.read(limit_bytes)
+                      if not chunk:
+                          break
+                      (out_dir / f"{base}.{chunk_idx:03d}").write_bytes(chunk)
+                      chunk_idx += 1
+              tmp_zip.unlink()
+
+          open_next()
+          for p, rel_posix in files:
+              raw = p.read_bytes()
+              comp_len = len(zlib.compress(raw, 6)) + len(rel_posix) + 128
+              if comp_len > target_bytes:
+                  split_oversized_file(p, rel_posix)
+                  continue
+              if cur_count > 0 and (cur_est + comp_len) > target_bytes:
+                  open_next()
+              zf.writestr(rel_posix, raw)
+              cur_est += comp_len
+              cur_count += 1
+
+          if zf is not None:
+              zf.close()
+              if cur_count == 0 and cur_path and cur_path.exists():
+                  cur_path.unlink()
+
+          created = sorted(out_dir.iterdir())
+          total = sum(f.stat().st_size for f in created)
+          max_actual = max((f.stat().st_size for f in created), default=0)
+          print(f"Packed {len(files)} files into {len(created)} part(s), total={total/1024/1024:.2f} MB, max_part={max_actual/1024/1024:.2f} MB")
+          for f in created:
+              print(f"  {f.name}: {f.stat().st_size/1024/1024:.2f} MB")
+          PY
+
       - name: Install rclone
         run: |
           if ! command -v rclone >/dev/null 2>&1; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
-          rclone version | head -n 2
 
-      - name: Sync extracted files to Google Drive/<repo_name> via rclone
+      - name: Sync ZIP parts to Google Drive/<repo_name> via rclone
         env:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
@@ -124,20 +223,17 @@ jobs:
           p.chmod(0o600)
           PY
 
-          echo "Syncing /tmp/src-repo -> gdrive:${REPO_NAME}"
-          rclone "${RCLONE_MODE}" /tmp/src-repo "gdrive:${REPO_NAME}" \
+          echo "Syncing /tmp/out-zips -> gdrive:${REPO_NAME}"
+          rclone "${RCLONE_MODE}" /tmp/out-zips "gdrive:${REPO_NAME}" \
             --config /tmp/rclone.conf \
-            --exclude ".git/**" \
-            --exclude ".github/**" \
             --transfers 8 \
             --checkers 16 \
             --fast-list \
-            --stats 15s \
-            --stats-one-line
+            -v
 
       - name: Cleanup temp files
         if: always()
-        run: rm -rf /tmp/rclone.conf /tmp/src-repo
+        run: rm -rf /tmp/rclone.conf /tmp/src-repo /tmp/out-zips
 
       - name: Auto-clean previous completed CI runs
         if: always()
