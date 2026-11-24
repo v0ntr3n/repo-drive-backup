@@ -1,6 +1,10 @@
 name: Download Video to Drive
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - "jobs.json"
   workflow_dispatch:
     inputs:
       url:
@@ -47,6 +51,12 @@ jobs:
     name: Download & Trim Media to Google Drive
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository (for repo jobs.json)
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Install yt-dlp, ffmpeg, and rclone
         run: |
           set -euo pipefail
@@ -114,6 +124,7 @@ jobs:
 
       - name: Download, trim, and upload clips to Google Drive
         env:
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_URL: ${{ inputs.url }}
           INPUT_START: ${{ inputs.start_time }}
           INPUT_END: ${{ inputs.end_time }}
@@ -135,10 +146,16 @@ jobs:
               cookies_file = pathlib.Path("/tmp/yt_cookies.txt")
               cookies_file.write_bytes(base64.b64decode(cookies_b64))
 
-          # Build job list from workflow input OR jobs.json in Drive root folder
+          # Build job list from: (1) repo jobs.json on push, (2) workflow_dispatch url, or (3) gdrive:jobs.json
+          event_name = os.environ.get("EVENT_NAME", "")
           url = os.environ.get("INPUT_URL", "").strip()
           used_drive_jobs = False
-          if url:
+          repo_jobs = pathlib.Path("jobs.json")
+
+          if event_name == "push" and repo_jobs.exists():
+              data = json.loads(repo_jobs.read_text(encoding="utf-8"))
+              jobs = data if isinstance(data, list) else data.get("jobs", [])
+          elif url:
               jobs = [{
                   "url": url,
                   "start": os.environ.get("INPUT_START", "").strip(),
@@ -218,7 +235,6 @@ jobs:
               ], check=True)
 
           if used_drive_jobs:
-              # Rename jobs.json -> jobs.done.json on Drive so it isn't reprocessed
               subprocess.run([
                   "rclone", "moveto", "gdrive:jobs.json", "gdrive:jobs.done.json",
                   "--config", "/tmp/rclone.conf"
