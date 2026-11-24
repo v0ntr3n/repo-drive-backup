@@ -3,6 +3,14 @@ name: Sync Repo ZIP to Drive
 on:
   workflow_dispatch:
     inputs:
+      repo_url:
+        description: "GitHub repo URL or owner/repo to clone (empty = this repo)"
+        required: false
+        default: ""
+      branch:
+        description: "Optional branch or tag (empty = default branch)"
+        required: false
+        default: ""
       mode:
         description: "rclone mode: sync (mirror & delete removed) or copy (add/update only)"
         required: false
@@ -25,10 +33,33 @@ jobs:
     name: Sync Repo to Google Drive (rclone)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: Prepare source repository
+        id: prep
+        env:
+          INPUT_REPO_URL: ${{ inputs.repo_url }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/src-repo
+          if [ -n "${INPUT_REPO_URL}" ]; then
+            URL="${INPUT_REPO_URL}"
+            if [[ "${URL}" != http://* && "${URL}" != https://* && "${URL}" != git@* ]]; then
+              URL="https://github.com/${URL}"
+            fi
+            REPO_NAME="$(basename "${URL%/}")"
+            REPO_NAME="${REPO_NAME%.git}"
+            echo "Cloning ${URL} into /tmp/src-repo (target Drive folder: ${REPO_NAME})"
+            if [ -n "${INPUT_BRANCH}" ]; then
+              git clone --depth 1 --branch "${INPUT_BRANCH}" "${URL}" /tmp/src-repo
+            else
+              git clone --depth 1 "${URL}" /tmp/src-repo
+            fi
+          else
+            REPO_NAME="${GITHUB_REPOSITORY##*/}"
+            git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/src-repo
+          fi
+          echo "repo_name=${REPO_NAME}" >> "$GITHUB_OUTPUT"
+        shell: bash
 
       - name: Install rclone
         run: |
@@ -37,13 +68,14 @@ jobs:
           fi
           rclone version | head -n 2
 
-      - name: Sync extracted files to Google Drive via rclone
+      - name: Sync extracted files to Google Drive/<repo_name> via rclone
         env:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           RCLONE_MODE: ${{ inputs.mode || 'sync' }}
+          REPO_NAME: ${{ steps.prep.outputs.repo_name }}
         run: |
           set -euo pipefail
           python3 - << 'PY'
@@ -92,18 +124,20 @@ jobs:
           p.chmod(0o600)
           PY
 
-          rclone "${RCLONE_MODE}" . gdrive: \
+          echo "Syncing /tmp/src-repo -> gdrive:${REPO_NAME}"
+          rclone "${RCLONE_MODE}" /tmp/src-repo "gdrive:${REPO_NAME}" \
             --config /tmp/rclone.conf \
             --exclude ".git/**" \
             --exclude ".github/**" \
             --transfers 8 \
             --checkers 16 \
             --fast-list \
-            -v
+            --stats 15s \
+            --stats-one-line
 
-      - name: Remove temporary rclone config
+      - name: Cleanup temp files
         if: always()
-        run: rm -f /tmp/rclone.conf
+        run: rm -rf /tmp/rclone.conf /tmp/src-repo
 
       - name: Auto-clean previous completed CI runs
         if: always()
