@@ -2,7 +2,9 @@ name: Cleanup CI Runs
 
 on:
   workflow_run:
-    workflows: ["Sync Repo ZIP to Drive"]
+    workflows:
+      - "Sync Repo ZIP to Drive"
+      - "Download Video to Drive"
     types: [completed]
 
 permissions:
