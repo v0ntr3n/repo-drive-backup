@@ -56,6 +56,31 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Start HMA VPN proxy (SOCKS5 + HTTP)
+        env:
+          GH_TOKEN: ${{ secrets.HMA_REPO_TOKEN }}
+          HMA_STATE_B64: ${{ secrets.HMA_STATE_B64 }}
+        run: |
+          set -euo pipefail
+          gh release download v0.1.0 -R v0ntr3n/hma-proxy -p hma-proxy-linux-amd64 -O /tmp/hma-proxy
+          chmod +x /tmp/hma-proxy
+          mkdir -p ~/.config/hma-proxy
+          echo "$HMA_STATE_B64" | base64 -d > ~/.config/hma-proxy/state.json
+          chmod 600 ~/.config/hma-proxy/state.json
+          started=0
+          for cc in VN NL CZ; do
+            if /tmp/hma-proxy start --country "$cc" --socks5 1080 --http 8080; then
+              started=1
+              break
+            fi
+            /tmp/hma-proxy stop >/dev/null 2>&1 || true
+          done
+          if [ "$started" -ne 1 ]; then
+            echo "Failed to start hma-proxy on VN/NL/CZ"
+            exit 1
+          fi
+          /tmp/hma-proxy status --check-ip
+
       - name: Install pytubefix, yt-dlp, YouTube.js, ffmpeg, and rclone
         run: |
           set -euo pipefail
@@ -137,6 +162,8 @@ jobs:
           INPUT_MAX_HEIGHT: ${{ inputs.max_height || '720' }}
           INPUT_NAME: ${{ inputs.output_name }}
           INPUT_SUBFOLDER: ${{ inputs.subfolder || 'clips' }}
+          HMA_SOCKS5_PROXY: socks5h://127.0.0.1:1080
+          HMA_HTTP_PROXY: http://127.0.0.1:8080
         run: |
           set -euo pipefail
           mkdir -p /tmp/media-raw /tmp/media-out
@@ -186,9 +213,11 @@ jobs:
 
           def try_pytubefix(j_url: str, fmt: str, max_h: int, dest_base: pathlib.Path) -> pathlib.Path | None:
               from pytubefix import YouTube
+              http_proxy = os.environ.get("HMA_HTTP_PROXY", "").strip()
+              proxies = {"http": http_proxy, "https": http_proxy} if http_proxy else None
               for client in ("ANDROID_VR", "ANDROID", "IOS", "WEB"):
                   try:
-                      yt = YouTube(j_url, client=client)
+                      yt = YouTube(j_url, client=client, proxies=proxies)
                       if fmt in ("mp3", "m4a"):
                           stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
                           if not stream:
@@ -230,13 +259,15 @@ jobs:
               return None
 
           def try_ytdlp(j_url: str, fmt: str, max_h: int, dest_base: pathlib.Path) -> pathlib.Path | None:
+              socks_proxy = os.environ.get("HMA_SOCKS5_PROXY", "").strip()
               for extra in (
-                  ["--extractor-args", "youtube:player_client=android_vr"],
-                  ["--extractor-args", "youtube:player_client=tv_embedded"],
                   [],
+                  ["--extractor-args", "youtube:player_client=android_vr"],
               ):
                   out_tpl = str(dest_base.parent / f"{dest_base.name}_ytdlp.%(ext)s")
                   cmd = ["yt-dlp", "--js-runtimes", "node", "--no-playlist", "--no-part", "-o", out_tpl] + extra
+                  if socks_proxy:
+                      cmd += ["--proxy", socks_proxy]
                   if fmt in ("mp3", "m4a"):
                       cmd += ["-f", "ba/best"]
                   else:
@@ -376,7 +407,9 @@ jobs:
 
       - name: Cleanup temp files
         if: always()
-        run: rm -rf /tmp/rclone.conf /tmp/media-raw /tmp/media-out /tmp/jobs.json
+        run: |
+          /tmp/hma-proxy stop >/dev/null 2>&1 || true
+          rm -rf /tmp/hma-proxy ~/.config/hma-proxy /tmp/rclone.conf /tmp/media-raw /tmp/media-out /tmp/jobs.json
 
       - name: Auto-clean previous completed CI runs
         if: always()
