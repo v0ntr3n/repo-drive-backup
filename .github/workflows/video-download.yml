@@ -365,7 +365,7 @@ jobs:
                       print(f"  [ERROR] trim/validate failed for {name}.{f_item}: {e}")
                       failed.append(f"{name}.{f_item}")
 
-          # Upload succeeded files to Drive AND copy into GH_backup/<sub/> for git commit
+          # Upload succeeded files to Drive only (do not bloat repo with GH_backup)
           if succeeded:
               for sub in sorted(subfolders_used):
                   sub_out = out_dir / sub
@@ -374,11 +374,6 @@ jobs:
                           "rclone", "copy", str(sub_out), f"gdrive:{sub}",
                           "--config", "/tmp/rclone.conf", "--transfers", "4", "-v"
                       ], check=True)
-                      gh_dest = pathlib.Path("GH_backup") / sub
-                      gh_dest.mkdir(parents=True, exist_ok=True)
-                      for f in sub_out.iterdir():
-                          if f.is_file():
-                              shutil.copy2(f, gh_dest / f.name)
 
           print(f"\nFINAL_SUMMARY: succeeded={len(succeeded)} failed={len(failed)}")
           if failed:
@@ -394,15 +389,18 @@ jobs:
               sys.exit(1)
           PY
 
-      - name: Commit and push validated clips to GitHub
+      - name: Auto-remove GH_backup if present
         if: always()
         run: |
-          if [ -d GH_backup ] && [ -n "$(git status --porcelain GH_backup)" ]; then
+          if [ -d GH_backup ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add GH_backup
-            git commit -m "media: add validated clips to GH_backup"
-            git push
+            git rm -rf --ignore-unmatch GH_backup
+            rm -rf GH_backup
+            if [ -n "$(git status --porcelain)" ]; then
+              git commit -m "chore: auto-remove GH_backup"
+              git push
+            fi
           fi
 
       - name: Cleanup temp files
