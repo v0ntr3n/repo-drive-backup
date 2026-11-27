@@ -10,6 +10,10 @@ on:
         required: true
         default: main
         type: string
+      show_failed_paths:
+        description: 'Publish failed relative paths and line numbers in PUBLIC logs'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -66,8 +70,15 @@ jobs:
             echo 'Private checkout failed.'
             exit 1
           fi
-      - name: Parse Lua files without publishing diagnostics
-        run: python3 tools/lua51_validate.py "$RUNNER_TEMP/lua-private"
+      - name: Parse Lua files
+        env:
+          SHOW_FAILED_PATHS: ${{ inputs.show_failed_paths }}
+        run: |
+          args=()
+          if [[ "$SHOW_FAILED_PATHS" == "true" ]]; then
+            args+=(--show-failed-paths)
+          fi
+          python3 tools/lua51_validate.py "$RUNNER_TEMP/lua-private" "${args[@]}"
       - name: Remove private checkout
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/lua-private"
