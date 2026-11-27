@@ -1,0 +1,73 @@
+name: Lua 5.1 Validation
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/lua51-validation.yml', 'tools/lua51_validate.py']
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Private source branch, tag or commit SHA
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validator-self-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y lua5.1
+      - run: python3 tools/lua51_validate.py --self-test
+
+  private-source-syntax:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validator-self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y lua5.1
+      - name: Fetch private source
+        env:
+          SOURCE_TOKEN: ${{ secrets.LUA_SCRIPTS_READ_TOKEN }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo 'Missing LUA_SCRIPTS_READ_TOKEN repository secret.'
+            exit 1
+          fi
+          if [[ ! "$TARGET_REF" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
+            echo 'Invalid source ref.'
+            exit 1
+          fi
+          src="$RUNNER_TEMP/lua-private"
+          mkdir -m 700 "$src"
+          git -C "$src" init -q
+          git -C "$src" remote add origin https://github.com/v0ntr3n/lua_scripts.git
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64 -w0)"
+          export GIT_TERMINAL_PROMPT=0
+          if ! git -C "$src" fetch -q --depth=1 origin "$TARGET_REF" >/dev/null 2>&1; then
+            echo 'Private fetch failed. Check token access and source ref.'
+            exit 1
+          fi
+          unset SOURCE_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          if ! git -C "$src" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD >/dev/null 2>&1; then
+            echo 'Private checkout failed.'
+            exit 1
+          fi
+      - name: Parse Lua files without publishing diagnostics
+        run: python3 tools/lua51_validate.py "$RUNNER_TEMP/lua-private"
+      - name: Remove private checkout
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/lua-private"
